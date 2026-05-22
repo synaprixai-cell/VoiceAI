@@ -21,7 +21,6 @@ class Config:
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
     elevenlabs_api_key: str = os.getenv("ELEVENLABS_API_KEY", "")
-    elevenlabs_api_key: str = os.getenv("ELEVENLABS_API_KEY", "")
     elevenlabs_voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "")
 
     # Business settings

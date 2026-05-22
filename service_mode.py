@@ -11,6 +11,8 @@ import os
 from enum import Enum
 from typing import Optional
 
+from google_calendar import _load_credentials
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +40,7 @@ async def check_calendar(gcal) -> bool:
     if gcal is None:
         return False
     try:
-        creds = gcal._get_credentials()
+        creds = _load_credentials(gcal.token_file)
         return creds is not None and creds.valid
     except Exception:
         return False

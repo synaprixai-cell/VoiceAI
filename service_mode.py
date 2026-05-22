@@ -38,7 +38,8 @@ async def check_calendar(gcal) -> bool:
     if gcal is None:
         return False
     try:
-        creds = gcal._get_credentials()
+        from google_calendar import _load_credentials
+        creds = _load_credentials(gcal.token_file)
         return creds is not None and creds.valid
     except Exception:
         return False

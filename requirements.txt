@@ -1,13 +1,21 @@
 # LiveKit Agents framework with plugins
 livekit-agents[deepgram,openai,silero,elevenlabs]>=0.11.0
-livekit-plugins-cartesia>=0.11.0
-livekit-plugins-elevenlabs>=0.3.0
+livekit-plugins-noise-cancellation>=0.2.5
+livekit-plugins-turn-detector>=1.3.5
+
+# Edge TTS (free Microsoft TTS fallback — no API key)
+edge-tts>=6.1.0
 
 # Database
 supabase>=2.3.0
 
 # Utilities
 python-dotenv>=1.0.0
+
+# Google Calendar (optional)
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.0.0
 
 # Testing
 pytest>=8.0.0

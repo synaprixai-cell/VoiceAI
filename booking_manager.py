@@ -203,14 +203,30 @@ class BookingManager:
         if self._gcal:
             free = await self._gcal.get_free_slots(date)
             if not free:
-                return f"No available slots on {date}."
-            return f"Available slots on {date}: {', '.join(free)}"
+                return f"no_slots|{date}"
+            return f"slots|{date}|{','.join(free)}"
 
         slots = await self.db.get_available_slots(date)
         if not slots:
-            return f"No available slots on {date}."
-        times = ", ".join(s["slot_time"][:5] for s in slots)
-        return f"Available slots on {date}: {times}"
+            return f"no_slots|{date}"
+        times = ",".join(s["slot_time"][:5] for s in slots)
+        return f"slots|{date}|{times}"
+
+    async def get_next_available(self, days_to_check: int = 7) -> str:
+        """Return the first few dates that have open slots, up to days_to_check days ahead."""
+        today = datetime.now().date()
+        found = []
+        for i in range(1, days_to_check + 1):
+            check_date = (today + timedelta(days=i)).strftime("%Y-%m-%d")
+            result = await self.get_slots(check_date)
+            if result.startswith("slots|"):
+                _, date_str, times = result.split("|", 2)
+                found.append(f"{date_str}: {times}")
+                if len(found) >= 3:
+                    break
+        if not found:
+            return "no_upcoming|none"
+        return "upcoming|" + ";".join(found)
 
     # ------------------------------------------------------------------
     # Booking

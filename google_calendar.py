@@ -1,13 +1,15 @@
 """
 Google Calendar integration for Maya voice receptionist.
-Handles availability checks and booking event management.
+Credentials are loaded from Supabase tenant_settings (shared with WhatsApp agent)
+so both agents always sync to the same calendar.
+Falls back to google_token.json for local dev.
 """
 
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from google.auth.transport.requests import Request
@@ -23,39 +25,136 @@ MYT = ZoneInfo(MY_TIMEZONE)
 SLOT_DURATION_MINUTES = 30
 
 
-def _load_credentials(token_file: str) -> Optional[Credentials]:
+# ---------------------------------------------------------------------------
+# Credential loading — DB first, file fallback
+# ---------------------------------------------------------------------------
+
+def _load_credentials_from_db(tenant_id: str) -> Tuple[Optional[Credentials], Optional[str]]:
+    """
+    Load Google OAuth credentials + calendar_id from tenant_settings.
+    Returns (credentials, calendar_id). Both may be None if not configured.
+    Automatically refreshes the access token and writes it back to the DB.
+    """
+    try:
+        from supabase import create_client
+        from config import Config
+        config = Config()
+
+        client = create_client(config.supabase_url, config.supabase_key)
+        result = (
+            client.table("tenant_settings")
+            .select("google_calendar_token,google_calendar_refresh,google_calendar_id")
+            .eq("tenant_id", tenant_id)
+            .maybe_single()
+            .execute()
+        )
+        if not result.data:
+            return None, None
+
+        refresh_token: Optional[str] = result.data.get("google_calendar_refresh")
+        access_token: Optional[str] = result.data.get("google_calendar_token")
+        calendar_id: str = result.data.get("google_calendar_id") or "primary"
+
+        if not refresh_token and not access_token:
+            return None, None
+
+        creds = Credentials(
+            token=access_token,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
+            client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
+            scopes=SCOPES,
+        )
+
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Write refreshed access token back so WhatsApp agent also benefits
+            try:
+                client.table("tenant_settings").update(
+                    {"google_calendar_token": creds.token}
+                ).eq("tenant_id", tenant_id).execute()
+            except Exception as e:
+                logger.warning("Could not write refreshed token to DB: %s", e)
+
+        return (creds if creds.valid else None), calendar_id
+
+    except Exception as e:
+        logger.warning("Could not load Google Calendar creds from DB: %s", e)
+        return None, None
+
+
+def _load_credentials_from_file(token_file: str) -> Optional[Credentials]:
+    """Load Google OAuth credentials from a local JSON file (local dev only)."""
     if not os.path.exists(token_file):
         return None
-    creds = Credentials.from_authorized_user_file(token_file, SCOPES)
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open(token_file, "w") as f:
-            f.write(creds.to_json())
-    return creds if creds and creds.valid else None
+    try:
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(token_file, "w") as f:
+                f.write(creds.to_json())
+        return creds if (creds and creds.valid) else None
+    except Exception as e:
+        logger.warning("Could not load Google Calendar creds from file: %s", e)
+        return None
 
+
+# ---------------------------------------------------------------------------
+# Manager
+# ---------------------------------------------------------------------------
 
 class GoogleCalendarManager:
-    """Manages Google Calendar events for appointment booking."""
+    """
+    Manages Google Calendar events for appointment booking.
+    Reads OAuth credentials from Supabase tenant_settings so both the
+    WhatsApp agent and voice agent share the same authorised calendar.
+    """
 
-    def __init__(self, calendar_id: str = "primary", token_file: str = "google_token.json"):
+    def __init__(
+        self,
+        calendar_id: str = "primary",
+        token_file: str = "google_token.json",
+        tenant_id: Optional[str] = None,
+    ):
         self.calendar_id = calendar_id
         self.token_file = token_file
+        self.tenant_id = tenant_id
         self._service = None
 
     def _get_service(self):
         if self._service:
             return self._service
-        creds = _load_credentials(self.token_file)
+
+        creds: Optional[Credentials] = None
+
+        # 1. Try DB credentials first (production — shared with WhatsApp agent)
+        if self.tenant_id:
+            db_creds, db_calendar_id = _load_credentials_from_db(self.tenant_id)
+            if db_creds:
+                creds = db_creds
+                # Use calendar_id from DB if not overridden
+                if db_calendar_id and self.calendar_id == "primary":
+                    self.calendar_id = db_calendar_id
+                logger.info("Google Calendar: using credentials from tenant_settings (tenant=%s)", self.tenant_id)
+
+        # 2. Fall back to local file (local dev with google_token.json)
+        if not creds:
+            creds = _load_credentials_from_file(self.token_file)
+            if creds:
+                logger.info("Google Calendar: using credentials from %s", self.token_file)
+
         if not creds:
             raise RuntimeError(
-                f"Google Calendar not authorised. Run setup_google_auth.py first. "
-                f"Token file not found: {self.token_file}"
+                "Google Calendar not authorised. Either:\n"
+                "  1. Connect Google Calendar in the dashboard settings, or\n"
+                f"  2. Run setup_google_auth.py locally to create {self.token_file}"
             )
+
         self._service = build("calendar", "v3", credentials=creds, cache_discovery=False)
         return self._service
 
     def _to_dt(self, date_str: str, time_str: str) -> datetime:
-        """Convert YYYY-MM-DD + HH:MM to a timezone-aware datetime in MYT."""
         naive = datetime.strptime(f"{date_str}T{time_str}", "%Y-%m-%dT%H:%M")
         return naive.replace(tzinfo=MYT)
 
@@ -64,11 +163,9 @@ class GoogleCalendarManager:
     # ------------------------------------------------------------------
 
     def _check_slot_sync(self, date_str: str, time_str: str) -> bool:
-        """Returns True if the slot is free (no overlapping events)."""
         service = self._get_service()
         start = self._to_dt(date_str, time_str)
         end = start + timedelta(minutes=SLOT_DURATION_MINUTES)
-
         body = {
             "timeMin": start.isoformat(),
             "timeMax": end.isoformat(),
@@ -80,11 +177,9 @@ class GoogleCalendarManager:
         return len(busy) == 0
 
     def _get_free_slots_sync(self, date_str: str, start_hour: int = 9, end_hour: int = 18) -> list[str]:
-        """Return list of free HH:MM slots for a given date."""
         service = self._get_service()
         day_start = self._to_dt(date_str, f"{start_hour:02d}:00")
         day_end = self._to_dt(date_str, f"{end_hour:02d}:00")
-
         body = {
             "timeMin": day_start.isoformat(),
             "timeMax": day_end.isoformat(),
@@ -93,8 +188,6 @@ class GoogleCalendarManager:
         }
         result = service.freebusy().query(body=body).execute()
         busy_blocks = result["calendars"].get(self.calendar_id, {}).get("busy", [])
-
-        # Build list of candidate slots
         busy_intervals = [
             (
                 datetime.fromisoformat(b["start"]).astimezone(MYT),
@@ -102,7 +195,6 @@ class GoogleCalendarManager:
             )
             for b in busy_blocks
         ]
-
         free = []
         current = day_start
         while current + timedelta(minutes=SLOT_DURATION_MINUTES) <= day_end:
@@ -121,7 +213,7 @@ class GoogleCalendarManager:
             return await asyncio.to_thread(self._check_slot_sync, date_str, time_str)
         except Exception as e:
             logger.error("Google Calendar availability check failed: %s", e)
-            return True  # Fail open — let Supabase double-booking guard catch it
+            return True  # Fail open — Supabase double-booking guard catches duplicates
 
     async def get_free_slots(self, date_str: str) -> list[str]:
         try:
@@ -135,22 +227,18 @@ class GoogleCalendarManager:
     # ------------------------------------------------------------------
 
     def _create_event_sync(
-        self,
-        name: str,
-        phone: str,
-        date_str: str,
-        time_str: str,
-        service_type: str,
-        booking_ref: str,
+        self, name: str, phone: str, date_str: str, time_str: str,
+        service_type: str, booking_ref: str,
     ) -> Optional[str]:
-        """Create calendar event, return event ID."""
         cal_service = self._get_service()
         start = self._to_dt(date_str, time_str)
         end = start + timedelta(minutes=SLOT_DURATION_MINUTES)
-
         event = {
             "summary": f"{service_type} — {name}",
-            "description": f"Customer: {name}\nPhone: {phone}\nBooking ref: {booking_ref}\nBooked via Maya Voice AI",
+            "description": (
+                f"Customer: {name}\nPhone: {phone}\n"
+                f"Booking ref: {booking_ref}\nBooked via Maya Voice AI"
+            ),
             "start": {"dateTime": start.isoformat(), "timeZone": MY_TIMEZONE},
             "end": {"dateTime": end.isoformat(), "timeZone": MY_TIMEZONE},
             "reminders": {
@@ -164,9 +252,7 @@ class GoogleCalendarManager:
         result = cal_service.events().insert(calendarId=self.calendar_id, body=event).execute()
         return result.get("id")
 
-    def _update_event_sync(
-        self, event_id: str, new_date_str: str, new_time_str: str
-    ) -> bool:
+    def _update_event_sync(self, event_id: str, new_date_str: str, new_time_str: str) -> bool:
         cal_service = self._get_service()
         event = cal_service.events().get(calendarId=self.calendar_id, eventId=event_id).execute()
         start = self._to_dt(new_date_str, new_time_str)

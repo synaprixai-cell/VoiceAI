@@ -174,7 +174,8 @@ def answer_faq(question: str) -> Optional[str]:
 # ── Booking manager ────────────────────────────────────────────────────────────
 
 def _gcal_available() -> bool:
-    return os.path.exists(config.google_token_file)
+    # DB-based auth (production via tenant_settings) or file-based auth (local dev)
+    return bool(getattr(config, "tenant_id", None)) or os.path.exists(config.google_token_file)
 
 
 class BookingManager:
@@ -186,6 +187,7 @@ class BookingManager:
             GoogleCalendarManager(
                 calendar_id=config.google_calendar_id,
                 token_file=config.google_token_file,
+                tenant_id=getattr(config, "tenant_id", None),
             )
             if _gcal_available()
             else None

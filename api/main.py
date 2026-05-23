@@ -14,9 +14,11 @@ import logging
 import os
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import sentry_sdk
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,26 +34,88 @@ from database import BookingDatabase
 logger = logging.getLogger(__name__)
 config = Config()
 
+# ---------------------------------------------------------------------------
+# Sentry — error tracking
+# ---------------------------------------------------------------------------
+
+if os.getenv("SENTRY_DSN"):
+    sentry_sdk.init(
+        dsn=os.getenv("SENTRY_DSN"),
+        traces_sample_rate=0.05,
+        environment=os.getenv("RAILWAY_ENVIRONMENT", "production"),
+    )
+    logger.info("Sentry initialised")
+
+# ---------------------------------------------------------------------------
+# App + CORS — locked to FRONTEND_URL only (no wildcard)
+# ---------------------------------------------------------------------------
+
 app = FastAPI(title="VoiceAI Backend", version="1.0.0")
+
+_allowed_origins = [o for o in [
+    os.getenv("FRONTEND_URL", "").strip().rstrip("/"),
+    "http://localhost:3000",
+] if o]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("FRONTEND_URL", ""),
-        "http://localhost:3000",
-        "https://*.vercel.app",
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Internal-Secret"],
 )
+
+# ---------------------------------------------------------------------------
+# Auth — internal secret shared between Next.js proxy and this API
+# ---------------------------------------------------------------------------
+
+_INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
+
+
+def _verify_internal_secret(req: Request) -> None:
+    """Reject requests that don't carry the correct X-Internal-Secret header."""
+    if not _INTERNAL_SECRET:
+        return  # Secret not configured — open (dev mode)
+    provided = req.headers.get("X-Internal-Secret", "")
+    if provided != _INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — token endpoint: 10/min per IP, 30/hour per tenant
+# ---------------------------------------------------------------------------
+
+_ip_calls:     dict[str, list[float]] = defaultdict(list)
+_tenant_calls: dict[str, list[float]] = defaultdict(list)
+_IP_LIMIT     = 10
+_IP_WINDOW    = 60.0      # seconds
+_TENANT_LIMIT = 30
+_TENANT_WINDOW = 3600.0   # seconds
+
+
+def _check_rate_limit(ip: str, tenant_id: str) -> None:
+    now = time.monotonic()
+
+    # Per-IP: 10 per minute
+    ip_window = [t for t in _ip_calls[ip] if now - t < _IP_WINDOW]
+    _ip_calls[ip] = ip_window
+    if len(ip_window) >= _IP_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
+    _ip_calls[ip].append(now)
+
+    # Per-tenant: 30 per hour
+    t_window = [t for t in _tenant_calls[tenant_id] if now - t < _TENANT_WINDOW]
+    _tenant_calls[tenant_id] = t_window
+    if len(t_window) >= _TENANT_LIMIT:
+        raise HTTPException(status_code=429, detail="Voice call limit reached. Try again later.")
+    _tenant_calls[tenant_id].append(now)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _supabase():
-    """Return a Supabase client using the same credentials as the agent."""
     from supabase import create_client
     return create_client(config.supabase_url, config.supabase_key)
 
@@ -60,17 +124,20 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[0].strip() if forwarded else (
+        request.client.host if request.client else "unknown"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 async def root():
-    return {
-        "service": "voiceai-backend",
-        "version": "1.0.0",
-        "status": "running",
-    }
+    return {"service": "voiceai-backend", "version": "1.0.0", "status": "running"}
 
 
 @app.get("/health")
@@ -79,24 +146,32 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# 1. Token Generation
+# 1. Token Generation — protected by internal secret + rate limit
 # ---------------------------------------------------------------------------
 
 @app.post("/api/voice-token")
 async def generate_voice_token(request: Request):
     """
     Generate a LiveKit JWT so a web client can join a voice room.
-    Body: { "participant_name": "...", "tenant_id": "..." (optional) }
+    Requires X-Internal-Secret header (set by Next.js proxy after auth).
+    Body: { "participant_name": "...", "tenant_id": "..." }
     Returns: { "token": "eyJ...", "room_name": "voice-...", "url": "wss://..." }
     """
+    _verify_internal_secret(request)
+
     try:
         from livekit.api import AccessToken, VideoGrants
     except ImportError:
-        raise HTTPException(500, "livekit-api package not installed. Add livekit-api to requirements.txt.")
+        raise HTTPException(500, "livekit-api package not installed.")
 
     body = await request.json()
     participant_name: str = body.get("participant_name", "Caller")
-    tenant_id: str = body.get("tenant_id", config.tenant_id)
+    tenant_id: str = body.get("tenant_id") or config.tenant_id
+
+    if not tenant_id:
+        raise HTTPException(400, "tenant_id is required")
+
+    _check_rate_limit(_client_ip(request), tenant_id)
 
     if not config.livekit_api_key or not config.livekit_api_secret:
         raise HTTPException(500, "LIVEKIT_API_KEY / LIVEKIT_API_SECRET not configured.")
@@ -111,7 +186,7 @@ async def generate_voice_token(request: Request):
         .with_ttl(timedelta(hours=1))
     )
 
-    # Log the new session in Supabase (best-effort)
+    # Log the new session (best-effort)
     try:
         sb = _supabase()
         await asyncio.to_thread(
@@ -124,15 +199,11 @@ async def generate_voice_token(request: Request):
     except Exception as exc:
         logger.warning("Could not log voice session: %s", exc)
 
-    return {
-        "token": token.to_jwt(),
-        "room_name": room_name,
-        "url": config.livekit_url,
-    }
+    return {"token": token.to_jwt(), "room_name": room_name, "url": config.livekit_url}
 
 
 # ---------------------------------------------------------------------------
-# 2. LiveKit Webhook
+# 2. LiveKit Webhook — verified by LiveKit signature
 # ---------------------------------------------------------------------------
 
 @app.post("/livekit/webhook")
@@ -140,14 +211,10 @@ async def livekit_webhook(
     request: Request,
     authorization: Optional[str] = Header(None),
 ):
-    """
-    Receive LiveKit room lifecycle events.
-    LiveKit signs the body with LIVEKIT_API_SECRET — we verify before processing.
-    """
+    """LiveKit signs the body with LIVEKIT_API_SECRET — we verify before processing."""
     body_bytes = await request.body()
     body_str = body_bytes.decode()
 
-    # Verify signature
     try:
         from livekit.api import WebhookReceiver
         receiver = WebhookReceiver(
@@ -165,7 +232,6 @@ async def livekit_webhook(
 
     sb = _supabase()
 
-    # Log every event for debugging / analytics
     try:
         await asyncio.to_thread(
             lambda: sb.table("livekit_events").insert({
@@ -178,15 +244,13 @@ async def livekit_webhook(
     except Exception as exc:
         logger.warning("Could not log livekit event: %s", exc)
 
-    # Update voice_session status based on event
     if room_name:
         if event_type == "room_started":
             try:
                 await asyncio.to_thread(
                     lambda: sb.table("voice_sessions")
                     .update({"status": "active"})
-                    .eq("livekit_room_id", room_name)
-                    .execute()
+                    .eq("livekit_room_id", room_name).execute()
                 )
             except Exception as exc:
                 logger.warning("room_started update failed: %s", exc)
@@ -196,8 +260,7 @@ async def livekit_webhook(
                 await asyncio.to_thread(
                     lambda: sb.table("voice_sessions")
                     .update({"status": "ended", "ended_at": _now_iso()})
-                    .eq("livekit_room_id", room_name)
-                    .execute()
+                    .eq("livekit_room_id", room_name).execute()
                 )
             except Exception as exc:
                 logger.warning("room_finished update failed: %s", exc)
@@ -206,7 +269,7 @@ async def livekit_webhook(
 
 
 # ---------------------------------------------------------------------------
-# 3. Admin — Bookings
+# 3. Admin — Bookings (protected by internal secret)
 # ---------------------------------------------------------------------------
 
 _VALID_STATUSES = {"pending", "confirmed", "cancelled", "completed", "rescheduled"}
@@ -214,17 +277,14 @@ _VALID_STATUSES = {"pending", "confirmed", "cancelled", "completed", "reschedule
 
 @app.get("/api/bookings")
 async def list_bookings(
+    request: Request,
     tenant_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 50,
 ):
-    """
-    List bookings with contact name and phone joined.
-    Query params: tenant_id, status, limit
-    """
+    _verify_internal_secret(request)
     tid = tenant_id or config.tenant_id
     sb = _supabase()
-
     try:
         query = (
             sb.table("bookings")
@@ -233,22 +293,18 @@ async def list_bookings(
         )
         if status:
             query = query.eq("status", status)
-
         result = await asyncio.to_thread(
-            lambda: query.order("scheduled_at", desc=True).limit(limit).execute()
+            lambda: query.order("scheduled_at", desc=True).limit(min(limit, 200)).execute()
         )
         return {"bookings": result.data, "count": len(result.data)}
     except Exception as exc:
         logger.error("list_bookings error: %s", exc)
-        raise HTTPException(500, str(exc))
+        raise HTTPException(500, "Internal server error")
 
 
 @app.patch("/api/bookings/{booking_id}")
 async def update_booking(booking_id: str, request: Request):
-    """
-    Update a booking's status.
-    Body: { "status": "cancelled" | "confirmed" | "completed" | ... }
-    """
+    _verify_internal_secret(request)
     body = await request.json()
     new_status: Optional[str] = body.get("status")
 
@@ -262,8 +318,7 @@ async def update_booking(booking_id: str, request: Request):
         result = await asyncio.to_thread(
             lambda: sb.table("bookings")
             .update({"status": new_status, "updated_at": _now_iso()})
-            .eq("id", booking_id)
-            .execute()
+            .eq("id", booking_id).execute()
         )
         if not result.data:
             raise HTTPException(404, "Booking not found")
@@ -272,28 +327,22 @@ async def update_booking(booking_id: str, request: Request):
         raise
     except Exception as exc:
         logger.error("update_booking error: %s", exc)
-        raise HTTPException(500, str(exc))
+        raise HTTPException(500, "Internal server error")
 
 
 # ---------------------------------------------------------------------------
-# 4. SIP / Inbound Phone Calls
+# 4. SIP / Inbound Phone Calls (protected by internal secret)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/sip/dial")
 async def sip_inbound(request: Request):
-    """
-    Called by your SIP provider (Twilio, Vonage, LiveKit SIP trunk) when a
-    phone call arrives. Creates a voice session record and returns the LiveKit
-    room name so the SIP bridge knows where to send the call.
-    Body: { "phone_number": "+60123456789", "caller_name": "..." }
-    """
+    _verify_internal_secret(request)
     body = await request.json()
     phone_number: str = body.get("phone_number", "unknown")
     caller_name: str = body.get("caller_name", "Phone Caller")
-    tenant_id: str = body.get("tenant_id", config.tenant_id)
+    tenant_id: str = body.get("tenant_id") or config.tenant_id
 
     room_name = f"sip-{int(time.time())}"
-
     sb = _supabase()
     try:
         await asyncio.to_thread(
@@ -307,12 +356,7 @@ async def sip_inbound(request: Request):
         logger.warning("Could not log SIP session: %s", exc)
 
     logger.info("SIP inbound | phone=%s | room=%s", phone_number, room_name)
-
-    return {
-        "room_name": room_name,
-        "livekit_url": config.livekit_url,
-        "status": "dispatched",
-    }
+    return {"room_name": room_name, "livekit_url": config.livekit_url, "status": "dispatched"}
 
 
 # ---------------------------------------------------------------------------

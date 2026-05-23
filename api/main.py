@@ -199,7 +199,7 @@ async def generate_voice_token(request: Request):
     except Exception as exc:
         logger.warning("Could not log voice session: %s", exc)
 
-    return {"token": token.to_jwt(), "room_name": room_name, "url": config.livekit_url}
+    return {"token": await token.to_jwt(), "room_name": room_name, "url": config.livekit_url}
 
 
 # ---------------------------------------------------------------------------

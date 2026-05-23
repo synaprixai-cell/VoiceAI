@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import unicodedata
-from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -67,27 +66,51 @@ def sanitize_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter — max 3 booking attempts per phone per hour (in-memory)
+# Rate limiter — DB-backed, survives restarts, max 3 attempts/hour per phone
 # ---------------------------------------------------------------------------
 
-_rate_store: dict[str, list[datetime]] = defaultdict(list)
 _RATE_LIMIT = 3
 _RATE_WINDOW = timedelta(hours=1)
 
 
-def check_rate_limit(phone: str) -> tuple[bool, str]:
-    """Return (allowed, message). Blocks after 3 attempts/hour per phone."""
-    now = datetime.now()
-    cutoff = now - _RATE_WINDOW
-    attempts = [t for t in _rate_store[phone] if t > cutoff]
-    _rate_store[phone] = attempts
-    if len(attempts) >= _RATE_LIMIT:
-        return False, (
-            "Too many booking attempts for this number. "
-            "Please try again in an hour or call us directly."
+async def check_rate_limit(phone: str) -> tuple[bool, str]:
+    """
+    DB-backed rate limit — survives Railway restarts.
+    Blocks after 3 booking attempts per phone number per hour.
+    Falls back to allowing the request if DB is unavailable.
+    """
+    try:
+        from supabase import create_client
+        client = create_client(config.supabase_url, config.supabase_key)
+        cutoff = (datetime.now() - _RATE_WINDOW).isoformat()
+
+        # Count recent attempts
+        result = await asyncio.to_thread(
+            lambda: client.table("rate_limit_entries")
+            .select("id", count="exact")
+            .eq("phone", phone)
+            .gte("attempted_at", cutoff)
+            .execute()
         )
-    _rate_store[phone].append(now)
-    return True, ""
+        count = result.count or 0
+
+        if count >= _RATE_LIMIT:
+            return False, (
+                "Too many booking attempts for this number. "
+                "Please try again in an hour or call us directly."
+            )
+
+        # Record this attempt
+        await asyncio.to_thread(
+            lambda: client.table("rate_limit_entries")
+            .insert({"phone": phone})
+            .execute()
+        )
+        return True, ""
+
+    except Exception as exc:
+        logger.warning("Rate limit DB check failed (allowing request): %s", exc)
+        return True, ""  # Fail open — don't block users if DB is down
 
 # ── FAQ knowledge base ────────────────────────────────────────────────────────
 
@@ -261,7 +284,7 @@ class BookingManager:
         if not name:
             return "I didn't catch the name correctly. Could you repeat it for me?"
 
-        allowed, rate_msg = check_rate_limit(phone)
+        allowed, rate_msg = await check_rate_limit(phone)
         if not allowed:
             return rate_msg
 

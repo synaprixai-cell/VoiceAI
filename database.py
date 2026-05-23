@@ -146,7 +146,7 @@ class BookingDatabase:
         def _sync():
             return (
                 self.client.table("bookings")
-                .update({"gcal_event_id": gcal_event_id})
+                .update({"calendar_event_id": gcal_event_id})
                 .eq("id", booking_id)
                 .execute()
             )
@@ -166,7 +166,7 @@ class BookingDatabase:
         def _sync():
             return (
                 self.client.table("bookings")
-                .select("id,scheduled_at,service_type,status,gcal_event_id")
+                .select("id,scheduled_at,service_type,status,calendar_event_id")
                 .eq("tenant_id", self.tenant_id)
                 .eq("contact_id", contact["id"])
                 .in_("status", ["confirmed", "rescheduled", "pending"])

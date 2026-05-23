@@ -322,7 +322,7 @@ class BookingManager:
         dt = booking["scheduled_at"][:16].replace("T", " ")
 
         # ── Google Calendar sync ──────────────────────────────────────────
-        gcal_id = booking.get("gcal_event_id")
+        gcal_id = booking.get("calendar_event_id")
         if self._gcal and gcal_id:
             await self._gcal.cancel_event(gcal_id)
 
@@ -360,7 +360,7 @@ class BookingManager:
             return "I wasn't able to reschedule. Please call us directly."
 
         # ── Google Calendar sync ──────────────────────────────────────────
-        gcal_id = booking.get("gcal_event_id")
+        gcal_id = booking.get("calendar_event_id")
         if self._gcal and gcal_id:
             await self._gcal.update_event(gcal_id, new_date, new_time)
 

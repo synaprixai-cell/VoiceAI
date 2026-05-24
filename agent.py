@@ -9,6 +9,7 @@ VAD : Silero
 
 import asyncio
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta
@@ -34,7 +35,13 @@ from livekit.agents import (
 from livekit.plugins import deepgram, elevenlabs, noise_cancellation, silero
 from livekit.plugins import groq as lk_groq
 from livekit.plugins import openai as lk_openai
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+# MultilingualModel is intentionally NOT imported here.
+# Importing it at module level registers an inference runner, which forces
+# the worker to spawn a separate subprocess that loads a neural network on
+# startup. On memory-constrained containers this subprocess OOMs, closing
+# the IPC channel before it sends InitializeResponse (DuplexClosed crash).
+# VAD-based endpointing (min/max_endpointing_delay) covers the same need.
 
 from booking_manager import BookingManager
 from config import Config
@@ -612,12 +619,10 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=tts_engines["en"],
         vad=vad,
 
-        # AI-based end-of-utterance detection for en/ms/ta/zh.
-        # Understands Manglish code-switching pauses vs. true turn end.
-        turn_detection=MultilingualModel(),
-
-        # Malaysian callers pause mid-sentence when switching languages.
-        # 0.7 s min avoids cutting them off; 4 s max prevents infinite waits.
+        # VAD-based endpointing — no separate inference subprocess required.
+        # MultilingualModel was removed because it registers an inference runner
+        # that spawns a subprocess which OOMs on constrained containers.
+        # The generous min/max delays below compensate for multilingual pauses.
         min_endpointing_delay=0.7,
         max_endpointing_delay=4.0,
 
@@ -697,10 +702,54 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup validation — runs before cli.run_app()
+# ---------------------------------------------------------------------------
+
+def _startup_checks() -> None:
+    """Validate environment and log resource state before the worker starts."""
+    _REQUIRED_ENV = [
+        "LIVEKIT_URL",
+        "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET",
+        "ELEVENLABS_API_KEY",
+        "DEEPGRAM_API_KEY",
+        "GROQ_API_KEY",
+    ]
+    missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
+    if missing:
+        logger.critical("Missing required environment variables: %s", missing)
+        sys.exit(1)
+    logger.info("Environment OK — all required variables present")
+
+    # Log available memory so OOM issues are visible in Railway logs.
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(("MemTotal", "MemAvailable")):
+                    logger.info("Memory: %s", line.strip())
+    except OSError:
+        pass  # not Linux
+
+    # Raise the file-descriptor limit to avoid EMFILE under load.
+    try:
+        import resource as _resource
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        target = min(65536, hard)
+        if soft < target:
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (target, hard))
+            logger.info("File descriptor limit raised: %d → %d", soft, target)
+        else:
+            logger.info("File descriptor limit: %d (hard=%d)", soft, hard)
+    except (ImportError, ValueError, OSError):
+        pass  # Windows or unprivileged container
+
+
+# ---------------------------------------------------------------------------
 # Worker — production-ready configuration
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    _startup_checks()
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
@@ -712,6 +761,10 @@ if __name__ == "__main__":
             # Avoids OOM-killing the subprocess while loading torch/Silero
             # in Railway's memory-constrained container.
             num_idle_processes=0,
+
+            # 60 s gives torch + plugin imports time to finish before the
+            # framework declares the subprocess dead (default is only 10 s).
+            initialize_process_timeout=60.0,
 
             # Stop accepting new calls at 70% CPU/memory load
             load_threshold=0.7,

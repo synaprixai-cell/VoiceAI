@@ -510,12 +510,16 @@ class MayaAgent(Agent):
 # ---------------------------------------------------------------------------
 
 def prewarm(proc: JobProcess) -> None:
-    proc.userdata["vad"] = silero.VAD.load(
-        activation_threshold=0.55,
-        min_speech_duration=0.15,
-        min_silence_duration=0.65,
-    )
-    logger.info("Prewarm complete — VAD loaded")
+    try:
+        proc.userdata["vad"] = silero.VAD.load(
+            activation_threshold=0.55,
+            min_speech_duration=0.15,
+            min_silence_duration=0.65,
+        )
+        logger.info("Prewarm complete — VAD loaded")
+    except Exception:
+        # Log clearly and continue — entrypoint will load VAD lazily per call.
+        logger.exception("Prewarm failed; VAD will be loaded on first call")
 
 
 # ---------------------------------------------------------------------------
@@ -704,10 +708,10 @@ if __name__ == "__main__":
             # Load VAD model before first call so callers never wait for it
             prewarm_fnc=prewarm,
 
-            # Production: keep 4 warm processes ready.
-            # Dev mode (python agent.py dev): 0 idle processes (saves RAM).
-            # ServerEnvOption handles this automatically based on --mode flag.
-            num_idle_processes=1,
+            # 0 idle processes: spawn on first call, not at startup.
+            # Avoids OOM-killing the subprocess while loading torch/Silero
+            # in Railway's memory-constrained container.
+            num_idle_processes=0,
 
             # Stop accepting new calls at 70% CPU/memory load
             load_threshold=0.7,

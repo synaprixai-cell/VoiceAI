@@ -678,7 +678,7 @@ async def entrypoint(ctx: JobContext) -> None:
         agent=agent,
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVCTelephony(),
+            noise_cancellation=noise_cancellation.BVC(),
         ),
     )
 

@@ -186,6 +186,26 @@ async def generate_voice_token(request: Request):
         .with_ttl(timedelta(hours=1))
     )
 
+    # ── Dispatch Maya to this room ────────────────────────────────────────
+    # agent_name="maya-receptionist" uses explicit dispatch mode — the agent
+    # worker will NOT join any room unless we call create_dispatch here.
+    try:
+        from livekit import api as lk_api
+        async with lk_api.LiveKitAPI(
+            url=config.livekit_url,
+            api_key=config.livekit_api_key,
+            api_secret=config.livekit_api_secret,
+        ) as lk:
+            await lk.agent_dispatch.create_dispatch(
+                lk_api.CreateAgentDispatchRequest(
+                    room=room_name,
+                    agent_name="maya-receptionist",
+                )
+            )
+        logger.info("Maya dispatched to room: %s", room_name)
+    except Exception as exc:
+        logger.warning("Agent dispatch failed (agent may not be running): %s", exc)
+
     # Log the new session (best-effort)
     try:
         sb = _supabase()

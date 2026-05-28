@@ -8,6 +8,7 @@ VAD : Silero
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -570,12 +571,133 @@ async def entrypoint(ctx: JobContext) -> None:
         min_silence_duration=0.65,
     )
 
-    # ── STT: ElevenLabs Scribe → Deepgram Nova-3 → Groq Whisper ──────────
-    stt_engine = stt_module.FallbackAdapter(
-        [
+    # ── Load tenant voice config from Supabase ────────────────────────────
+    # Dispatch metadata carries tenant_id set by api/main.py at token time.
+    metadata_str = getattr(ctx.job, "metadata", "") or ""
+    metadata = json.loads(metadata_str) if metadata_str else {}
+    tenant_id = metadata.get("tenant_id") or config.tenant_id
+
+    tenant_cfg: dict = {}
+    try:
+        sb = _supabase()
+        result = await asyncio.to_thread(
+            lambda: sb.table("tenant_settings")
+            .select("voice_llm_config,voice_stt_config,voice_tts_config,voice_provider_credentials")
+            .eq("tenant_id", tenant_id)
+            .maybeSingle()
+            .execute()
+        )
+        tenant_cfg = result.data or {}
+    except Exception as _exc:
+        logger.warning("Could not load tenant voice config: %s — using defaults", _exc)
+
+    llm_cfg  = tenant_cfg.get("voice_llm_config")  or {}
+    stt_cfg  = tenant_cfg.get("voice_stt_config")  or {}
+    tts_cfg  = tenant_cfg.get("voice_tts_config")  or {}
+    # ARCHITECTURE NOTE: voice_provider_credentials stores per-tenant API keys.
+    # The agent reads them via service-role key so they never touch the browser.
+    creds: dict = tenant_cfg.get("voice_provider_credentials") or {}
+
+    llm_provider = llm_cfg.get("provider", "groq")
+    llm_model    = llm_cfg.get("model", "llama-3.3-70b-versatile")
+    stt_provider = stt_cfg.get("provider", "deepgram")
+    tts_provider = tts_cfg.get("provider", "elevenlabs")
+    tts_voice_id = tts_cfg.get("voice_id", "")  # empty = use ELEVENLABS_VOICES defaults
+
+    def _key(provider: str) -> str:
+        """Resolve API key: tenant DB cred first, then global env var."""
+        return (creds.get(provider) or {}).get("api_key", "") or getattr(config, f"{provider}_api_key", "")
+
+    logger.info("Tenant %s | LLM=%s/%s | STT=%s | TTS=%s",
+                tenant_id[:8], llm_provider, llm_model, stt_provider, tts_provider)
+
+    # ── LLM ───────────────────────────────────────────────────────────────
+    def _build_llm() -> llm_module.LLM:
+        if llm_provider == "groq":
+            key = _key("groq") or config.groq_api_key
+            return llm_module.FallbackAdapter([
+                lk_groq.LLM(model=llm_model, api_key=key),
+                lk_groq.LLM(model="llama-3.1-8b-instant", api_key=key),
+            ])
+        if llm_provider == "nvidia":
+            key = _key("nvidia") or config.nvidia_api_key
+            # NVIDIA NIM is OpenAI-compatible — point at their endpoint
+            return lk_openai.LLM(
+                model=llm_model,
+                api_key=key,
+                base_url="https://integrate.api.nvidia.com/v1",
+            )
+        if llm_provider == "openai":
+            key = _key("openai") or config.openai_api_key
+            return lk_openai.LLM(model=llm_model, api_key=key)
+        if llm_provider == "anthropic":
+            key = _key("anthropic") or config.anthropic_api_key
+            try:
+                from livekit.plugins import anthropic as lk_anthropic
+                return lk_anthropic.LLM(model=llm_model, api_key=key)
+            except ImportError:
+                logger.warning("livekit-plugins-anthropic not installed — falling back to Groq")
+        if llm_provider == "google":
+            key = _key("google") or config.google_api_key
+            try:
+                from livekit.plugins import google as lk_google
+                return lk_google.LLM(model=llm_model, api_key=key)
+            except ImportError:
+                logger.warning("livekit-plugins-google not installed — falling back to Groq")
+        # Default Groq fallback
+        return llm_module.FallbackAdapter([
+            lk_groq.LLM(model="llama-3.3-70b-versatile", api_key=config.groq_api_key),
+            lk_groq.LLM(model="llama-3.1-8b-instant",    api_key=config.groq_api_key),
+        ])
+
+    llm_engine = _build_llm()
+
+    # ── STT ───────────────────────────────────────────────────────────────
+    def _build_stt() -> stt_module.STT:
+        if stt_provider == "elevenlabs":
+            key = _key("elevenlabs") or config.elevenlabs_api_key
+            # Scribe v2 realtime → Deepgram fallback
+            return stt_module.FallbackAdapter([
+                elevenlabs.STT(api_key=key, use_realtime=True),
+                deepgram.STT(api_key=config.deepgram_api_key, model="nova-3"),
+            ])
+        if stt_provider == "deepgram":
+            key = _key("deepgram") or config.deepgram_api_key
+            return deepgram.STT(api_key=key, model="nova-3")
+        if stt_provider == "groq":
+            key = _key("groq") or config.groq_api_key
+            return stt_module.StreamAdapter(
+                stt=lk_openai.STT(
+                    model="whisper-large-v3-turbo",
+                    api_key=key,
+                    base_url="https://api.groq.com/openai/v1",
+                ),
+                vad=vad,
+            )
+        if stt_provider == "openai":
+            key = _key("openai") or config.openai_api_key
+            return stt_module.StreamAdapter(
+                stt=lk_openai.STT(model="whisper-1", api_key=key),
+                vad=vad,
+            )
+        if stt_provider == "assemblyai":
+            key = _key("assemblyai")
+            try:
+                from livekit.plugins import assemblyai as lk_assemblyai
+                return lk_assemblyai.STT(api_key=key)
+            except ImportError:
+                logger.warning("livekit-plugins-assemblyai not installed — falling back to Deepgram")
+        if stt_provider == "nvidia":
+            key = _key("nvidia") or config.nvidia_api_key
+            try:
+                from livekit.plugins import nvidia as lk_nvidia
+                return lk_nvidia.STT(api_key=key)
+            except ImportError:
+                logger.warning("livekit-plugins-nvidia not installed — falling back to Deepgram")
+        # Default: Scribe → Deepgram → Groq Whisper chain
+        return stt_module.FallbackAdapter([
             elevenlabs.STT(api_key=config.elevenlabs_api_key, use_realtime=True),
             deepgram.STT(api_key=config.deepgram_api_key, model="nova-3"),
-            # Groq Whisper is non-streaming — wrap with StreamAdapter + prewarmed VAD
             stt_module.StreamAdapter(
                 stt=lk_openai.STT(
                     model="whisper-large-v3-turbo",
@@ -584,33 +706,72 @@ async def entrypoint(ctx: JobContext) -> None:
                 ),
                 vad=vad,
             ),
-        ]
-    )
+        ])
 
-    # ── LLM: Groq plugin (handles Groq tool-schema validation natively) ───
-    llm_engine = llm_module.FallbackAdapter(
-        [
-            lk_groq.LLM(model="llama-3.3-70b-versatile", api_key=config.groq_api_key),
-            lk_groq.LLM(model="llama-3.1-8b-instant",    api_key=config.groq_api_key),
-        ]
-    )
+    stt_engine = _build_stt()
 
-    # ── TTS: ElevenLabs turbo, one voice per language ─────────────────────
-    # Do NOT pass language= — voice IDs may reject specific language codes
-    # causing immediate WebSocket disconnect. eleven_turbo_v2_5 auto-detects
-    # language from text. streaming_latency=3 → ~250ms first-audio vs ~1s.
-    tts_engines = {
-        lang: elevenlabs.TTS(
-            voice_id=voice_id,
-            model="eleven_turbo_v2_5",
-            api_key=config.elevenlabs_api_key,
-            streaming_latency=3,
-        )
-        for lang, voice_id in ELEVENLABS_VOICES.items()
-    }
+    # ── TTS ───────────────────────────────────────────────────────────────
+    # ElevenLabs eleven_turbo_v2_5 auto-detects language from text — do NOT
+    # pass language= (some voice IDs reject specific codes, closing the WS).
+    def _build_tts() -> tuple[dict, dict]:
+        fallbacks = {lang: EdgeTTS(language=lang) for lang in ("en", "ms", "zh", "ta")}
 
-    # ── TTS fallback: Edge TTS free regional voices ───────────────────────
-    tts_fallbacks = {lang: EdgeTTS(language=lang) for lang in ELEVENLABS_VOICES}
+        if tts_provider == "elevenlabs":
+            key = _key("elevenlabs") or config.elevenlabs_api_key
+            # Use configured voice_id for EN; per-language voices for others.
+            voices = {
+                "en": tts_voice_id or ELEVENLABS_VOICES["en"],
+                "ms": ELEVENLABS_VOICES["ms"],
+                "zh": ELEVENLABS_VOICES["zh"],
+                "ta": ELEVENLABS_VOICES["ta"],
+            }
+            engines = {
+                lang: elevenlabs.TTS(
+                    voice_id=vid,
+                    model="eleven_turbo_v2_5",
+                    api_key=key,
+                    streaming_latency=3,
+                )
+                for lang, vid in voices.items()
+            }
+            return engines, fallbacks
+
+        if tts_provider == "openai":
+            key = _key("openai") or config.openai_api_key
+            voice = tts_voice_id or "nova"
+            eng = lk_openai.TTS(voice=voice, api_key=key)
+            return {lang: eng for lang in ("en", "ms", "zh", "ta")}, fallbacks
+
+        if tts_provider == "deepgram":
+            key = _key("deepgram") or config.deepgram_api_key
+            model = tts_voice_id or "aura-asteria-en"
+            eng = deepgram.TTS(api_key=key, model=model)
+            return {lang: eng for lang in ("en", "ms", "zh", "ta")}, fallbacks
+
+        if tts_provider == "cartesia":
+            key = _key("cartesia")
+            try:
+                from livekit.plugins import cartesia as lk_cartesia
+                voice = tts_voice_id or "a0e99841-438a-4b77-9b73-a01b03daf92c"
+                eng = lk_cartesia.TTS(api_key=key, voice=voice)
+                return {lang: eng for lang in ("en", "ms", "zh", "ta")}, fallbacks
+            except ImportError:
+                logger.warning("livekit-plugins-cartesia not installed — falling back to ElevenLabs")
+
+        # Default: ElevenLabs per-language
+        el_key = config.elevenlabs_api_key
+        engines = {
+            lang: elevenlabs.TTS(
+                voice_id=vid,
+                model="eleven_turbo_v2_5",
+                api_key=el_key,
+                streaming_latency=3,
+            )
+            for lang, vid in ELEVENLABS_VOICES.items()
+        }
+        return engines, fallbacks
+
+    tts_engines, tts_fallbacks = _build_tts()
 
     # ── Agent session ─────────────────────────────────────────────────────
     session = AgentSession(

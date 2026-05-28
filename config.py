@@ -21,8 +21,12 @@ class Config:
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
     elevenlabs_api_key: str = os.getenv("ELEVENLABS_API_KEY", "")
-    elevenlabs_api_key: str = os.getenv("ELEVENLABS_API_KEY", "")
     elevenlabs_voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "")
+    # Optional — used when tenant picks these providers in Voice Settings
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    google_api_key: str = os.getenv("GOOGLE_API_KEY", "")
+    nvidia_api_key: str = os.getenv("NVIDIA_API_KEY", "")
 
     # Business settings
     business_name: str = os.getenv("BUSINESS_NAME", "My Clinic")

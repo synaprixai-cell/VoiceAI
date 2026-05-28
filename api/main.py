@@ -10,6 +10,7 @@ GET  /health            — health check
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -200,6 +201,7 @@ async def generate_voice_token(request: Request):
                 lk_api.CreateAgentDispatchRequest(
                     room=room_name,
                     agent_name="maya-receptionist",
+                    metadata=json.dumps({"tenant_id": tenant_id}),
                 )
             )
         logger.info("Maya dispatched to room: %s", room_name)

@@ -290,11 +290,13 @@ def _greeting() -> str:
 
 class MayaAgent(Agent):
     def __init__(self, *, tts_engines: dict, tts_fallbacks: dict,
-                 db: Optional["BookingDatabase"] = None, room_id: str = ""):
+                 db: Optional["BookingDatabase"] = None,
+                 bm: Optional["BookingManager"] = None,
+                 room_id: str = ""):
         self._detected_lang: str = "en"
         self._tts_engines = tts_engines
         self._tts_fallbacks = tts_fallbacks
-        self.bm = BookingManager()
+        self.bm = bm or BookingManager(db=db)
         self._db = db
         self._room_id = room_id
         self._conv_state: dict = {"step": 0, "lang": "en", "collected": {}}
@@ -552,10 +554,17 @@ async def entrypoint(ctx: JobContext) -> None:
     room_name: str = ctx.room.name if ctx.room else "unknown"
     job_id: str = str(ctx.job.id) if ctx.job else "-"
 
+    # ── Tenant identity (from dispatch metadata) ──────────────────────────
+    # Parse FIRST so BookingDatabase uses the correct tenant from the start.
+    metadata_str = getattr(ctx.job, "metadata", "") or ""
+    metadata = json.loads(metadata_str) if metadata_str else {}
+    tenant_id = metadata.get("tenant_id") or config.tenant_id
+
     # ── Service health check ──────────────────────────────────────────────
-    db = BookingDatabase()
-    bm_temp = BookingManager()
-    mode = await determine_mode(db, bm_temp._gcal)
+    # Single BookingDatabase + BookingManager shared across the whole session.
+    db = BookingDatabase(tenant_id=tenant_id)
+    bm = BookingManager(db=db)
+    mode = await determine_mode(db, bm._gcal)
     logger.info("Service mode: %s | room: %s", mode.value, room_name)
 
     # ── Session tracking ──────────────────────────────────────────────────
@@ -572,16 +581,11 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     # ── Load tenant voice config from Supabase ────────────────────────────
-    # Dispatch metadata carries tenant_id set by api/main.py at token time.
-    metadata_str = getattr(ctx.job, "metadata", "") or ""
-    metadata = json.loads(metadata_str) if metadata_str else {}
-    tenant_id = metadata.get("tenant_id") or config.tenant_id
-
+    # Reuse the existing db.client — no second Supabase connection needed.
     tenant_cfg: dict = {}
     try:
-        sb = _supabase()
         result = await asyncio.to_thread(
-            lambda: sb.table("tenant_settings")
+            lambda: db.client.table("tenant_settings")
             .select("voice_llm_config,voice_stt_config,voice_tts_config,voice_provider_credentials")
             .eq("tenant_id", tenant_id)
             .maybeSingle()
@@ -600,9 +604,16 @@ async def entrypoint(ctx: JobContext) -> None:
 
     llm_provider = llm_cfg.get("provider", "groq")
     llm_model    = llm_cfg.get("model", "llama-3.3-70b-versatile")
-    stt_provider = stt_cfg.get("provider", "deepgram")
+    # Default STT is Groq Whisper — free and supports all 4 Malaysian languages.
+    # Deepgram Nova-3 is English/Mandarin only and will garble Malay/Tamil.
+    stt_provider = stt_cfg.get("provider", "groq")
     tts_provider = tts_cfg.get("provider", "elevenlabs")
-    tts_voice_id = tts_cfg.get("voice_id", "")  # empty = use ELEVENLABS_VOICES defaults
+    # Per-language voice IDs — each language gets its own configurable ElevenLabs voice
+    tts_voice_id    = tts_cfg.get("voice_id", "")       # legacy single-voice fallback
+    tts_voice_id_en = tts_cfg.get("voice_id_en", "")
+    tts_voice_id_ms = tts_cfg.get("voice_id_ms", "")
+    tts_voice_id_zh = tts_cfg.get("voice_id_zh", "")
+    tts_voice_id_ta = tts_cfg.get("voice_id_ta", "")
 
     def _key(provider: str) -> str:
         """Resolve API key: tenant DB cred first, then global env var."""
@@ -653,27 +664,46 @@ async def entrypoint(ctx: JobContext) -> None:
     llm_engine = _build_llm()
 
     # ── STT ───────────────────────────────────────────────────────────────
+    def _groq_whisper(key: str) -> stt_module.StreamAdapter:
+        """Groq Whisper-large-v3-turbo: free, <300 ms, supports Malay/Tamil/Chinese."""
+        return stt_module.StreamAdapter(
+            stt=lk_openai.STT(
+                model="whisper-large-v3-turbo",
+                api_key=key,
+                base_url="https://api.groq.com/openai/v1",
+            ),
+            vad=vad,
+        )
+
     def _build_stt() -> stt_module.STT:
-        if stt_provider == "elevenlabs":
-            key = _key("elevenlabs") or config.elevenlabs_api_key
-            # Scribe v2 realtime → Deepgram fallback
-            return stt_module.FallbackAdapter([
-                elevenlabs.STT(api_key=key, use_realtime=True),
-                deepgram.STT(api_key=config.deepgram_api_key, model="nova-3"),
-            ])
-        if stt_provider == "deepgram":
-            key = _key("deepgram") or config.deepgram_api_key
-            return deepgram.STT(api_key=key, model="nova-3")
         if stt_provider == "groq":
             key = _key("groq") or config.groq_api_key
-            return stt_module.StreamAdapter(
-                stt=lk_openai.STT(
-                    model="whisper-large-v3-turbo",
-                    api_key=key,
-                    base_url="https://api.groq.com/openai/v1",
-                ),
-                vad=vad,
-            )
+            return _groq_whisper(key)
+
+        if stt_provider == "elevenlabs":
+            key = _key("elevenlabs") or config.elevenlabs_api_key
+            groq_key = _key("groq") or config.groq_api_key
+            # ElevenLabs Scribe is realtime multilingual; Groq Whisper as fallback
+            adapters: list = [elevenlabs.STT(api_key=key, use_realtime=True)]
+            if groq_key:
+                adapters.append(_groq_whisper(groq_key))
+            return stt_module.FallbackAdapter(adapters)
+
+        if stt_provider == "deepgram":
+            # Deepgram Nova-3 is English/Mandarin only — does NOT support Bahasa Melayu
+            # or Tamil. Groq Whisper runs FIRST so all 4 languages are transcribed
+            # correctly; Deepgram remains as fallback if Groq is unavailable.
+            deepgram_key = _key("deepgram") or config.deepgram_api_key
+            groq_key = _key("groq") or config.groq_api_key
+            deepgram_stt = deepgram.STT(api_key=deepgram_key, model="nova-3",
+                                        detect_language=True)
+            if groq_key:
+                return stt_module.FallbackAdapter([
+                    _groq_whisper(groq_key),
+                    deepgram_stt,
+                ])
+            return deepgram_stt
+
         if stt_provider == "openai":
             key = _key("openai") or config.openai_api_key
             return stt_module.StreamAdapter(
@@ -686,27 +716,25 @@ async def entrypoint(ctx: JobContext) -> None:
                 from livekit.plugins import assemblyai as lk_assemblyai
                 return lk_assemblyai.STT(api_key=key)
             except ImportError:
-                logger.warning("livekit-plugins-assemblyai not installed — falling back to Deepgram")
+                logger.warning("livekit-plugins-assemblyai not installed — falling back to Groq Whisper")
         if stt_provider == "nvidia":
             key = _key("nvidia") or config.nvidia_api_key
             try:
                 from livekit.plugins import nvidia as lk_nvidia
                 return lk_nvidia.STT(api_key=key)
             except ImportError:
-                logger.warning("livekit-plugins-nvidia not installed — falling back to Deepgram")
-        # Default: Scribe → Deepgram → Groq Whisper chain
-        return stt_module.FallbackAdapter([
-            elevenlabs.STT(api_key=config.elevenlabs_api_key, use_realtime=True),
-            deepgram.STT(api_key=config.deepgram_api_key, model="nova-3"),
-            stt_module.StreamAdapter(
-                stt=lk_openai.STT(
-                    model="whisper-large-v3-turbo",
-                    api_key=config.groq_api_key,
-                    base_url="https://api.groq.com/openai/v1",
-                ),
-                vad=vad,
-            ),
-        ])
+                logger.warning("livekit-plugins-nvidia not installed — falling back to Groq Whisper")
+
+        # Default: Groq Whisper (multilingual, free) → ElevenLabs Scribe → Deepgram
+        groq_key = config.groq_api_key
+        adapters = []
+        if groq_key:
+            adapters.append(_groq_whisper(groq_key))
+        if config.elevenlabs_api_key:
+            adapters.append(elevenlabs.STT(api_key=config.elevenlabs_api_key, use_realtime=True))
+        if config.deepgram_api_key:
+            adapters.append(deepgram.STT(api_key=config.deepgram_api_key, model="nova-3"))
+        return stt_module.FallbackAdapter(adapters) if len(adapters) > 1 else adapters[0]
 
     stt_engine = _build_stt()
 
@@ -718,12 +746,13 @@ async def entrypoint(ctx: JobContext) -> None:
 
         if tts_provider == "elevenlabs":
             key = _key("elevenlabs") or config.elevenlabs_api_key
-            # Use configured voice_id for EN; per-language voices for others.
+            # Per-language voice IDs: settings UI values override hardcoded defaults.
+            # tts_voice_id is the legacy single-field for backward compat.
             voices = {
-                "en": tts_voice_id or ELEVENLABS_VOICES["en"],
-                "ms": ELEVENLABS_VOICES["ms"],
-                "zh": ELEVENLABS_VOICES["zh"],
-                "ta": ELEVENLABS_VOICES["ta"],
+                "en": tts_voice_id_en or tts_voice_id or ELEVENLABS_VOICES["en"],
+                "ms": tts_voice_id_ms or ELEVENLABS_VOICES["ms"],
+                "zh": tts_voice_id_zh or ELEVENLABS_VOICES["zh"],
+                "ta": tts_voice_id_ta or ELEVENLABS_VOICES["ta"],
             }
             engines = {
                 lang: elevenlabs.TTS(
@@ -824,6 +853,7 @@ async def entrypoint(ctx: JobContext) -> None:
         tts_engines=tts_engines,
         tts_fallbacks=tts_fallbacks,
         db=db,
+        bm=bm,
         room_id=room_name,
     )
     if existing_state:

@@ -4,6 +4,7 @@ Supabase = source of truth for contacts/bookings/sessions.
 Google Calendar = synced automatically when google_token.json exists.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -84,7 +85,15 @@ async def check_rate_limit(phone: str) -> tuple[bool, str]:
         client = create_client(config.supabase_url, config.supabase_key)
         cutoff = (datetime.now() - _RATE_WINDOW).isoformat()
 
-        # Count recent attempts
+        # Prune all expired entries first — keeps the table from growing forever
+        await asyncio.to_thread(
+            lambda: client.table("rate_limit_entries")
+            .delete()
+            .lt("attempted_at", cutoff)
+            .execute()
+        )
+
+        # Count recent attempts for this phone
         result = await asyncio.to_thread(
             lambda: client.table("rate_limit_entries")
             .select("id", count="exact")
@@ -204,8 +213,8 @@ def _gcal_available() -> bool:
 class BookingManager:
     """High-level booking helpers called by agent function tools."""
 
-    def __init__(self):
-        self.db = BookingDatabase()
+    def __init__(self, db: Optional[BookingDatabase] = None):
+        self.db = db or BookingDatabase()
         self._gcal: Optional[GoogleCalendarManager] = (
             GoogleCalendarManager(
                 calendar_id=config.google_calendar_id,

@@ -17,9 +17,9 @@ class BookingDatabase:
     Only availability_slots is a new table added for this agent.
     """
 
-    def __init__(self):
+    def __init__(self, tenant_id: Optional[str] = None):
         self.client: Client = create_client(config.supabase_url, config.supabase_key)
-        self.tenant_id: str = config.tenant_id
+        self.tenant_id: str = tenant_id or config.tenant_id
 
     # ------------------------------------------------------------------
     # Contacts

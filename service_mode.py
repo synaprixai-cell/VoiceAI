@@ -8,10 +8,16 @@ EMERGENCY : Database down                 → transfer all calls to human
 
 import logging
 import os
+import time as _time
 from enum import Enum
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Cache determine_mode results per tenant for 5 minutes to avoid
+# a Supabase ping + Google Calendar credential check on every call start.
+_mode_cache: dict[str, tuple["ServiceMode", float]] = {}
+_MODE_TTL = 300.0
 
 
 class ServiceMode(Enum):
@@ -45,18 +51,26 @@ async def check_calendar(gcal) -> bool:
 
 
 async def determine_mode(db, gcal=None) -> ServiceMode:
+    cache_key = getattr(db, "tenant_id", "default")
+    cached = _mode_cache.get(cache_key)
+    if cached and _time.monotonic() < cached[1]:
+        return cached[0]
+
     db_ok = await check_database(db)
     if not db_ok:
         logger.error("ServiceMode → EMERGENCY (database unreachable)")
-        return ServiceMode.EMERGENCY
+        result = ServiceMode.EMERGENCY
+    else:
+        cal_ok = await check_calendar(gcal)
+        if gcal is not None and not cal_ok:
+            logger.warning("ServiceMode → DEGRADED (calendar unreachable, bookings still work)")
+            result = ServiceMode.DEGRADED
+        else:
+            logger.info("ServiceMode → FULL")
+            result = ServiceMode.FULL
 
-    cal_ok = await check_calendar(gcal)
-    if gcal is not None and not cal_ok:
-        logger.warning("ServiceMode → DEGRADED (calendar unreachable, bookings still work)")
-        return ServiceMode.DEGRADED
-
-    logger.info("ServiceMode → FULL")
-    return ServiceMode.FULL
+    _mode_cache[cache_key] = (result, _time.monotonic() + _MODE_TTL)
+    return result
 
 
 def mode_notice(mode: ServiceMode, language: str = "en") -> Optional[str]:

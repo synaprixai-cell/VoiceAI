@@ -197,6 +197,19 @@ async def generate_voice_token(request: Request):
             api_key=config.livekit_api_key,
             api_secret=config.livekit_api_secret,
         ) as lk:
+            # Pre-create the room with a 5-minute empty timeout so zombie
+            # rooms (e.g. browser crash mid-call) are automatically destroyed.
+            try:
+                await lk.room.create_room(
+                    lk_api.CreateRoomRequest(
+                        name=room_name,
+                        empty_timeout=300,   # destroy after 5 min if empty
+                        max_participants=2,  # agent + 1 caller
+                    )
+                )
+            except Exception as room_exc:
+                logger.debug("Room pre-creation skipped: %s", room_exc)
+
             await lk.agent_dispatch.create_dispatch(
                 lk_api.CreateAgentDispatchRequest(
                     room=room_name,
@@ -205,6 +218,9 @@ async def generate_voice_token(request: Request):
                 )
             )
         logger.info("Maya dispatched to room: %s", room_name)
+        # Give the agent worker ~0.5 s head-start before the client connects
+        # so the first words the caller speaks are not lost to setup latency.
+        await asyncio.sleep(0.5)
     except Exception as exc:
         logger.warning("Agent dispatch failed (agent may not be running): %s", exc)
 
